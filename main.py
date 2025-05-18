@@ -141,6 +141,8 @@ async def join(interaction: discord.Interaction, channl: discord.VoiceChannel):
             await interaction.response.send_message(f"🔄 已移動到 `{channl.name}`", ephemeral=True)
     else:
         await channl.connect()
+        # 初始化該 guild 的 queue
+        queues[interaction.guild.id] = asyncio.Queue()
         await interaction.response.send_message(f"✅ 已加入 `{channl.name}`")
 
 # /leave 離開語音
@@ -163,7 +165,11 @@ async def play(interaction: discord.Interaction, song: str):
         await interaction.followup.send("❌ 請先加入語音頻道")
         return
 
-    query = "ytsearch1:" + song
+    # 判斷是否為 YouTube 連結
+    if song.startswith("http://") or song.startswith("https://"):
+        query = song
+    else:
+        query = "ytsearch1:" + song
     try:
         result = await search_ytdlp_async(query, ydl_opts)
         tracks = result.get("entries", [])
