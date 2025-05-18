@@ -293,7 +293,7 @@ async def unloop(interaction: discord.Interaction):
 # /pause 暫停當前歌曲
 @bot.tree.command(name="pause", description="暫停當前歌曲")
 async def pause(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
+    vc = interaction.guild.voice_client 
     if not vc or not vc.is_connected() or not vc.is_playing():
         await interaction.response.send_message("❌ 沒有正在播放的音樂", ephemeral=True)
         return
@@ -338,7 +338,7 @@ async def say(interaction: discord.Interaction, message: str):
     if interaction.user.id != allowedd_user:
         await interaction.response.send_message("❌ 你沒有權限使用這個指令！", ephemeral=True)
         return
-    await interaction.response.send_message(message)
+    await interaction.channel.send(message)
 
 
 # 啟動 bot
