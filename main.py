@@ -33,6 +33,9 @@ bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
 # 全域 ThreadPoolExecutor，避免每次查詢都新建
 thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
+# 單曲循環狀態（每個 guild 各自獨立）
+loop_flags = defaultdict(bool)
+
 # 非同步搜尋 YouTube 音樂（使用 subprocess，不佔用 thread pool）
 async def search_ytdlp_async(query, ydl_opts):
     """
@@ -83,6 +86,9 @@ async def play_next(guild: discord.Guild, channel: discord.TextChannel):
         return
 
     def after_playing(error):
+        # 單曲循環：若啟用則將剛剛播放的歌曲再放回 queue 最前面
+        if loop_flags[guild.id]:
+            queues[guild.id]._queue.appendleft((audio_url, title, author))
         fut = asyncio.run_coroutine_threadsafe(play_next(guild, channel), bot.loop)
         try:
             fut.result()
@@ -241,7 +247,7 @@ async def queue(interaction: discord.Interaction):
     result = random.choices(color, weights=[0.5, 0.5, 0.5, 0.5], k=1)[0]
     embed = discord.Embed(title="🎵 當前音樂佇列", description="\n".join(queue_list) if queue_list else "📭 音樂佇列是空的！", color=result)
     await interaction.response.send_message(embed=embed)
-
+#/clear_queue 清空音樂佇列或刪除指定歌曲
 @bot.tree.command(name="clear_queue", description="清空音樂佇列或刪除指定歌曲")
 @app_commands.describe(index="要刪除的歌曲編號（留空則清空全部）")
 async def clear_queue(interaction: discord.Interaction, index: int = 0):
@@ -261,6 +267,64 @@ async def clear_queue(interaction: discord.Interaction, index: int = 0):
         await interaction.response.send_message(f"🗑️ 已刪除第 {index} 首歌：`{removed[1]}`")
     else:
         await interaction.response.send_message("❌ 無效的歌曲編號！", ephemeral=True)
+#/loop 啟用單曲循環
+@bot.tree.command(name="loop", description="啟用單曲循環（持續重複播放當前歌曲）")
+async def loop(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_playing():
+        await interaction.response.send_message("❌ 沒有正在播放的音樂", ephemeral=True)
+        return
+    loop_flags[interaction.guild.id] = True
+    await interaction.response.send_message("🔁 單曲循環已啟用，將持續重複播放當前歌曲")
+# /unloop 停用單曲循環
+@bot.tree.command(name="unloop", description="停用單曲循環")
+async def unloop(interaction: discord.Interaction):
+    if loop_flags[interaction.guild.id]:
+        loop_flags[interaction.guild.id] = False
+        await interaction.response.send_message("⏹️ 單曲循環已停用")
+    else:
+        await interaction.response.send_message("⚠️ 單曲循環本來就未啟用", ephemeral=True)
+# /pause 暫停當前歌曲
+@bot.tree.command(name="pause", description="暫停當前歌曲")
+async def pause(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected() or not vc.is_playing():
+        await interaction.response.send_message("❌ 沒有正在播放的音樂", ephemeral=True)
+        return
+    if vc.is_paused():
+        await interaction.response.send_message("⏸️ 音樂已經是暫停狀態", ephemeral=True)
+        return
+    vc.pause()
+    await interaction.response.send_message("⏸️ 當前歌曲已暫停")
+
+@bot.tree.command(name="resume", description="繼續播放當前歌曲")
+async def resume(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        await interaction.response.send_message("❌ 沒有語音連線", ephemeral=True)
+        return
+    if not vc.is_paused():
+        await interaction.response.send_message("▶️ 音樂未處於暫停狀態", ephemeral=True)
+        return
+    vc.resume()
+    await interaction.response.send_message("▶️ 當前歌曲已繼續播放")
+@bot.tree.command(name="shuffle", description="隨機播放音樂佇列（不影響正在播放的歌曲）")
+async def shuffle(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        await interaction.response.send_message("❌ 沒有語音連線", ephemeral=True)
+        return
+    q = queues[interaction.guild.id]
+    queue_items = list(q._queue)
+    if not queue_items:
+        await interaction.response.send_message("❌ 音樂佇列是空的！", ephemeral=True)
+        return
+    # 隨機打亂佇列（不影響正在播放的歌曲）
+    random.shuffle(queue_items)
+    q._queue.clear()
+    for item in queue_items:
+        q._queue.append(item)
+    await interaction.response.send_message("🔀 已隨機打亂待播佇列")
 
 # 啟動 bot
 if __name__ == "__main__":
