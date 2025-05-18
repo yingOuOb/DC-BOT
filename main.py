@@ -331,6 +331,15 @@ async def shuffle(interaction: discord.Interaction):
     for item in queue_items:
         q._queue.append(item)
     await interaction.response.send_message("🔀 已隨機打亂待播佇列")
+@bot.tree.command(name="say", description="讓機器人輸出你輸入的訊息")
+@app_commands.describe(message="你想讓機器人說的內容")
+async def say(interaction: discord.Interaction, message: str):
+    allowedd_user=683130418031362202
+    if interaction.user.id != allowedd_user:
+        await interaction.response.send_message("❌ 你沒有權限使用這個指令！", ephemeral=True)
+        return
+    await interaction.response.send_message(message)
+
 
 # 啟動 bot
 if __name__ == "__main__":
