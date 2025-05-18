@@ -64,6 +64,8 @@ async def search_ytdlp_async(query, ydl_opts):
 async def play_next(guild: discord.Guild, channel: discord.TextChannel):
     vc = guild.voice_client
     if not vc or not vc.is_connected():
+        # 沒有連接語音時，設為休眠狀態
+        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="休眠狀態💤"))
         return
 
     if vc.is_playing():
@@ -76,6 +78,8 @@ async def play_next(guild: discord.Guild, channel: discord.TextChannel):
         title = item[1] if len(item) > 1 and item[1] else '未知'
         author = item[2] if len(item) > 2 and item[2] else '未知'
     except asyncio.QueueEmpty:
+        # 佇列空時，設為休眠狀態
+        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="休眠狀態💤"))
         return
 
     def after_playing(error):
@@ -91,11 +95,19 @@ async def play_next(guild: discord.Guild, channel: discord.TextChannel):
     source.author = author
     source.audio_url = audio_url
     vc.play(source, after=after_playing)
+    # 播放時設為歌曲名稱
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=title))
     await channel.send(f"🎶 正在播放：`{title}`")
 
 # Bot 啟動時
 @bot.event
 async def on_ready():
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.listening,
+            name="休眠狀態💤"
+        )
+    )
     slash_commands = await bot.tree.sync()
     print("\n".join(f'已註冊 {sc.name} 指令' for sc in slash_commands))
     print(f"{bot.user} 已登入")
