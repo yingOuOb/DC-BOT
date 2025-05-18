@@ -104,7 +104,7 @@ async def play_next(guild: discord.Guild, channel: discord.TextChannel):
 async def on_ready():
     await bot.change_presence(
         activity=discord.Activity(
-            type=discord.ActivityType.listening,
+            type=discord.ActivityType.playing,
             name="休眠狀態💤"
         )
     )
