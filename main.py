@@ -17,6 +17,7 @@ ydl_opts = {
     'noplaylist': True,
     'youtube_include_dash_manifest': False,
     'youtube_include_hls_manifest': False,
+    "default_search": "ytsearch",
 }
 
 # ffmpeg 設定
@@ -42,26 +43,18 @@ async def search_ytdlp_async(query, ydl_opts):
     使用 asyncio subprocess 執行 yt-dlp 查詢 YouTube 音樂，
     完全不佔用 thread pool，查詢與播放互不干擾。
     """
-    # 構建 yt-dlp 命令列
-    ytdlp_cmd = [
-        YTDLP_PATH, '--no-playlist', '--print-json', '-f', ydl_opts['format'], '--skip-download', query
-    ]
-    # 啟動 subprocess
-    proc = await asyncio.create_subprocess_exec(
-        *ytdlp_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise Exception(f"yt-dlp error: {stderr.decode(errors='ignore')}")
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        result = ydl.extract_info(f"ytsearch1:{query}", download=False)
+
+
     # 解析 JSON 結果
     try:
-        result = json.loads(stdout.decode())
+        # result = json.loads()
         # 模擬原本 entries 結構
         return {"entries": [result]}
     except Exception as e:
-        raise Exception(f"yt-dlp output parse error: {e}\nRaw: {stdout.decode(errors='ignore')}")
+        raise Exception(f"yt-dlp output parse error: {e}\nRaw: {result}")
 
 # 播放下一首（將 title/author 設為 source 屬性，方便 /queue 顯示）
 async def play_next(guild: discord.Guild, channel: discord.TextChannel):
