@@ -9,16 +9,19 @@ import concurrent.futures
 import json
 from imageio_ffmpeg import get_ffmpeg_exe
 import random 
+import logging
+import subprocess
 
-
+current_playing_proccess:subprocess.Popen = None
+current_volume = 0.15
+#大展鴻圖
 # yt-dlp 設定
-ydl_opts = {
-    'format': 'bestaudio[ext=m4a]/bestaudio',
-    'noplaylist': True,
-    'youtube_include_dash_manifest': False,
-    'youtube_include_hls_manifest': False,
-    "default_search": "ytsearch",
-}
+# ydl_opts = {
+#     'format': 'bestaudio[ext=m4a]/bestaudio',
+#     'noplaylist': True,
+#     'youtube_include_dash_manifest': False,
+#     'youtube_include_hls_manifest': False,
+# }
 
 # ffmpeg 設定
 ffmpeg_opts = {
@@ -31,70 +34,135 @@ queues = defaultdict(asyncio.Queue)
 
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
 
-# 全域 ThreadPoolExecutor，避免每次查詢都新建
-thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-
 # 單曲循環狀態（每個 guild 各自獨立）
 loop_flags = defaultdict(bool)
 
-# 非同步搜尋 YouTube 音樂（使用 subprocess，不佔用 thread pool）
-async def search_ytdlp_async(query, ydl_opts):
-    """
-    使用 asyncio subprocess 執行 yt-dlp 查詢 YouTube 音樂，
-    完全不佔用 thread pool，查詢與播放互不干擾。
-    """
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        result = ydl.extract_info(f"ytsearch1:{query}", download=False)
-
-
-    # 解析 JSON 結果
+# 非同步搜尋 YouTube 音樂（只回傳歌曲資訊，不回傳 direct stream url）
+def search_ytdlp_async(query, max_result=10):
+    # logging.debug(f"search_ytdlp_async query: {query}")
+    def ytdlp_search():
+        if query.startswith("http://") or query.startswith("https://"):
+            # 若是網址，直接回傳
+            ydl_opts = {
+                'format': 'bestaudio[ext=m4a]/bestaudio',
+                'noplaylist': True,
+                'youtube_include_dash_manifest': False,
+                'youtube_include_hls_manifest': False,
+                'extract_flat': True,
+                'quiet': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+                return [{
+                    'title': info.get('title'),
+                    'author': info.get('uploader') or info.get('artist'),
+                    'url': query,
+                    'duration': info.get('duration'),
+                    'thumbnail': info.get('thumbnail'),
+                }]
+        ydl_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio',
+            'noplaylist': True,
+            'youtube_include_dash_manifest': False,
+            'youtube_include_hls_manifest': False,
+            'extract_flat': True,
+            'default_search': 'ytsearch',
+            'quiet': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{max_result}:{query}", download=False)
+            # 若是 playlist/search 結果
+            if 'entries' in info:
+                info2 = info['entries']
+            # 只回傳必要資訊
+                return [{
+                    'title': data.get('title'),
+                    'author': data.get('uploader') or data.get('artist'),
+                    'url': data.get('url'),
+                    'duration': data.get('duration'),
+                    'thumbnail': data.get('thumbnail'),
+                } for data in info2]
     try:
-        # result = json.loads()
-        # 模擬原本 entries 結構
-        return {"entries": [result]}
+        result = ytdlp_search()
+        return result
     except Exception as e:
-        raise Exception(f"yt-dlp output parse error: {e}\nRaw: {result}")
+        raise Exception(f"yt-dlp 查詢失敗: {e}")
 
-# 播放下一首（將 title/author 設為 source 屬性，方便 /queue 顯示）
+# 取得 direct stream url（僅用於播放）
+async def get_direct_stream_url(webpage_url):
+    ydl_opts = {
+            'quiet': True,  # Suppress yt-dlp output
+            'format': 'bestaudio/best',  # Ensure we only deal with audio or best formats
+            # 'default_search': 'ytsearch',  # Use YouTube search
+            'extract_flat': True,  # Get metadata only, no downloads
+            'noplaylist': True,  # Exclude playlists
+            'quiet': True,  # Suppress yt-dlp output
+        }
+    loop = asyncio.get_running_loop()
+    def ytdlp_get_url():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(webpage_url, download=False)
+            return info.get('url')
+    try:
+        url = await loop.run_in_executor(None, ytdlp_get_url)
+        return url
+    except Exception as e:
+        raise Exception(f"direct stream url 取得失敗: {e}")
+
+# 播放下一首（根據 queue 內的 webpage_url 取得 direct stream url 再播放）
+# play_next 會根據 queue 內的 webpage_url 取得 direct stream url（audio_url）
+# audio_url 是直接給 FFmpeg 播放的音訊串流網址
 async def play_next(guild: discord.Guild, channel: discord.TextChannel):
+    global current_playing_proccess
+    global current_volume
     vc = guild.voice_client
     if not vc or not vc.is_connected():
-        # 沒有連接語音時，設為休眠狀態
         await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.playing, name="休眠狀態💤"))
         return
-
     if vc.is_playing():
         return
-
     try:
-        # 嘗試取得 (audio_url, title, author)，若無則補 '未知'
         item = queues[guild.id].get_nowait()
-        audio_url = item[0] if len(item) > 0 else 'N/A'
+        webpage_url = item[0] if len(item) > 0 else None
         title = item[1] if len(item) > 1 and item[1] else '未知'
         author = item[2] if len(item) > 2 and item[2] else '未知'
+        if not webpage_url:
+            await channel.send(f"❌ 佇列歌曲網址無效，已跳過。")
+            await play_next(guild, channel)
+            return
+        # 取得 direct stream url（audio_url）
+        try:
+            audio_url = await get_direct_stream_url(webpage_url)
+        except Exception as e:
+            await channel.send(f"❌ 取得 direct stream url 失敗：{e}，已跳過。")
+            await play_next(guild, channel)
+            return
     except asyncio.QueueEmpty:
-        # 佇列空時，設為休眠狀態
         await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.playing, name="休眠狀態💤"))
         return
-
     def after_playing(error):
-        # 單曲循環：若啟用則將剛剛播放的歌曲再放回 queue 最前面
+        global current_playing_proccess
+        current_playing_proccess.terminate()
         if loop_flags[guild.id]:
-            queues[guild.id]._queue.appendleft((audio_url, title, author))
+            queues[guild.id]._queue.appendleft((webpage_url, title, author))
         fut = asyncio.run_coroutine_threadsafe(play_next(guild, channel), bot.loop)
         try:
             fut.result()
         except Exception as e:
             print(f"播放錯誤：{e}")
+    print(f"正在播放：{title} | 作者：{author} | 來源：{webpage_url}")
 
-    source = PCMVolumeTransformer(FFmpegPCMAudio(audio_url, **ffmpeg_opts), volume=0.4)
-    # 將 title/author/audio_url 屬性掛到 source 物件上，方便 /queue 顯示
+    ffmpeg_options = (
+            f"ffmpeg -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+            f"-i {audio_url} -acodec libopus -f opus -ar 48000 -ac 2 pipe:1"
+        )
+    current_playing_proccess = subprocess.Popen(ffmpeg_options.split(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    source = PCMVolumeTransformer(FFmpegPCMAudio(current_playing_proccess.stdout, pipe=True), volume=current_volume)
     source.title = title
     source.author = author
-    source.audio_url = audio_url
+    source.audio_url = audio_url  # 這裡的 audio_url 是 direct stream url
     vc.play(source, after=after_playing)
-    # 播放時設為歌曲名稱
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=title))
     await channel.send(f"🎶 正在播放：`{title}`")
 
@@ -149,6 +217,8 @@ async def leave(interaction: discord.Interaction):
         await interaction.response.send_message("❌ 我不在語音頻道")
 
 # /play 播放歌曲（加入佇列）
+# /play 指令：queue 只存 (webpage_url, title, author)，不存 direct stream url
+# audio_url 僅在播放時才會產生
 @bot.tree.command(name="play", description="播放音樂")
 @app_commands.describe(song="要播放的音樂網址或關鍵字")
 async def play(interaction: discord.Interaction, song: str):
@@ -160,38 +230,50 @@ async def play(interaction: discord.Interaction, song: str):
 
     # 判斷是否為 YouTube 連結
     if song.startswith("http://") or song.startswith("https://"):
-        query = song
+        url = song
+        info = search_ytdlp_async(url, 1)
+        info = info[0] if info else None
+
     else:
-        query = "ytsearch1:" + song
+        query = song
+        info = search_ytdlp_async(query, 1)
+        info = info[0] if info else None
+        url = info.get('url', None) if info else None
     try:
-        result = await search_ytdlp_async(query, ydl_opts)
-        tracks = result.get("entries", [])
-        if not tracks:
+        if url is None:
             await interaction.followup.send("❌ 找不到音樂")
             return
-
-        track = tracks[0]
-        audio_url = track.get("url")
-        title = track.get("title")
-        author = track.get("uploader") or track.get("artist") or None
-
+        # queue 只存 (webpage_url, title, author)
+        # audio_url（direct stream url）不會在這裡產生
         queue_empty = queues[interaction.guild.id].empty()
-        await queues[interaction.guild.id].put((audio_url, title, author))
-        await interaction.followup.send(f"🔄 已加入佇列：`{title}`")
-
+        await queues[interaction.guild.id].put((url, info['title'], info['author']))
+        await interaction.followup.send(f"🔄 已加入佇列：`{info['title']}`")
         if not vc.is_playing():
             await play_next(interaction.guild, interaction.channel)
-
     except Exception as e:
+        logging.exception("播放音樂時發生錯誤：")
         await interaction.followup.send(f"❌ 發生錯誤：{e}")
+
+@play.autocomplete("song")
+async def song_autocomplete(ctx:discord.Interaction, current:str):
+    logging.debug(f"autocomplete current: {current}")
+    loop = asyncio.get_running_loop()
+    # Run the blocking search in a thread
+    videos = await loop.run_in_executor(None, search_ytdlp_async, current, 10)
+    logging.debug(f"autocomplete videos: {videos}")
+    return [
+            discord.app_commands.Choice(name=video["title"], value=video["url"])
+            for video in videos
+        ]
 
 # /volume 調整音量
 @bot.tree.command(name="volume", description="調整播放音量（單位：百分比）")
 @app_commands.describe(percent="音量百分比（例如：70 = 70%）")
 async def volume(interaction: discord.Interaction, percent: int):
+    global current_volume
     if percent < 0 or percent > 100:
         await interaction.response.send_message("❌ 音量請輸入 0 ~100 之間的數值", ephemeral=True)
-        if percent >100:
+        if percent > 100:
             await interaction.followup.send("阿你耳朵不好喔", ephemeral=True)
         return
 
@@ -200,14 +282,16 @@ async def volume(interaction: discord.Interaction, percent: int):
         await interaction.response.send_message("❌ 沒有正在播放的音樂", ephemeral=True)
         return
 
+    # 若目前有 PCMVolumeTransformer，直接調整音量
     if isinstance(vc.source, discord.PCMVolumeTransformer):
-        vc.source.volume = percent / 100
+        current_volume = percent / 100
+        vc.source.volume = current_volume
         await interaction.response.send_message(f"🔊 音量已設定為 `{percent}%`")
     else:
         await interaction.response.send_message("⚠️ 無法調整音量", ephemeral=True)
 #/current_volume 顯示當前音量
 @bot.tree.command(name="current_volume", description="顯示當前音量")
-async def current_volume(interaction: discord.Interaction):
+async def current1_volume(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if not vc or not vc.is_playing():
         await interaction.response.send_message("❌ 沒有正在播放的音樂", ephemeral=True)
@@ -239,9 +323,12 @@ async def queue(interaction: discord.Interaction):
     # 直接從 queue 物件取得所有待播歌曲
     queue_list = []
     for idx, item in enumerate(list(queues[interaction.guild.id]._queue)):
-        queue_list.append(f"{idx+1}. 標題: `{item[1]}`\n   作者: `{item[2] if len(item) > 2 and item[2] else '未知'}`")
+        # item: (audio_url, title, author)
+        title = item[1] if len(item) > 1 and item[1] else '未知'
+        author = item[2] if len(item) > 2 and item[2] else '未知'
+        queue_list.append(f"{idx+1}. 標題: `{title}` | 作者: `{author}`")
     if now_playing:
-        queue_list.insert(0, f"▶️ 正在播放: `{now_playing[1]}`\n   作者: `{now_playing[2]}`")
+        queue_list.insert(0, f"▶️ 正在播放: `{now_playing[1]}` | 作者: `{now_playing[2]}`")
     color = [0x10c919, 0x2d3fe0, 0x5400a3, 0xcc0621]
     result = random.choices(color, weights=[0.5, 0.5, 0.5, 0.5], k=1)[0]
     embed = discord.Embed(title="🎵 當前音樂佇列", description="\n".join(queue_list) if queue_list else "📭 音樂佇列是空的！", color=result)
